@@ -3,11 +3,15 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
+using System.Reflection;
+using System.Xml.Schema;
+using Unity.VisualScripting;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.UIElements;
 using Point = System.ValueTuple<int, int>;
+using Random = System.Random;
 
 public class Map : MonoBehaviour
 {
@@ -19,40 +23,47 @@ public class Map : MonoBehaviour
     public Sprite[] cryheads;
     public Sprite[] smileheads;
     public Sprite[] exitings;
+    public Sprite[] trappings;
     public Sprite[] straights;
     public Sprite[] turns;
     public Sprite[] tails;
     public Sprite[] halfs;
 
-    public Sprite wall;
-    public Sprite trap;
-    public Sprite closedexit;
-    public Sprite openexit;
-    public Sprite chili;
-    public Sprite banana;
-    public Sprite ice;
+    public GameObject wall;
+    public GameObject trap;
+    public GameObject exit;
+    public GameObject chili;
+    public GameObject banana;
+    public GameObject ice;
+    public GameObject wood;
+    public GameObject fire;
+    public GameObject dust;
+
+    public AudioSource audiosrc;
+    public AudioSource spitsrc;
+
+    public AudioClip[] eatsounds;
+    public AudioClip[] movesounds;
+    public AudioClip growsound;
+    public AudioClip trapsound;
+    public AudioClip exitsound;
+    public AudioClip pushsound;
+    public AudioClip fallsound;
 
     private const int maxsizex = 31, maxsizey = 17;
     private int sizex0, sizex1, sizey0, sizey1;
 
+    private float groundz = 40;
+    private float backz = 38;
+    private float itemz = 10;
+    private float snakez = 10;
+    private float fallz = 100;
+
     private float spittime = 0.1f;
 
-    public enum Back
-    {
-        none,
-        ground,
-        trap,
-        exit,
-    }
-    public enum Item
-    {
-        none,
-        wall,
-        chili,
-        banana,
-        ice,
-    }
+    private CameraVib camvib;
 
+    private Random rand = new Random();
     public enum Status
     {
         still,
@@ -63,95 +74,51 @@ public class Map : MonoBehaviour
         falling,
         dropping,
         exiting,
+        trapped,
 
         win,
         lose,
     }
-    private Back[,] back;
-    private Item[,] item;
-
-    private int foodcnt;
-
-
     private Status status = Status.still;
 
-    private Queue<GameObject> unuseds = new Queue<GameObject>();
-    private Queue<GameObject> usings = new Queue<GameObject>();
+    private GameObject[,] ground;
+    private GameObject[,] back;
+    private GameObject[,] item;
+    private GameObject exitobj;
+    private GameObject fireobj;
+    private GameObject dustobj;
 
-    private Queue<Point> snake = new Queue<Point>();
-    private List<(Point, Item)> mvit = new List<(Point, Item)>();
+    private LinkedList<(GameObject, Point, int)> skl = new LinkedList<(GameObject, Point, int)>();
+    private List<(GameObject, Point)> mvitem = new List<(GameObject, Point)>();
+
+
+    private int foodcnt;
 
     private float delt;//[0,1]
     private int mdir;
 
-
-    //Object Pool Part
-    private GameObject GetObject()
+    Vector3 CalcSnakeVec(Point p)
     {
-        GameObject obj;
-        if (unuseds.Count > 0)
-        {
-            obj = unuseds.Dequeue();
-            obj.SetActive(true);
-        }
-        else
-        {
-            obj = new GameObject();
-            obj.AddComponent<SpriteRenderer>();
-        }
-        usings.Enqueue(obj);
+        return new Vector3(p.Item1 + sizex0, p.Item2 + sizey0, p.Item2 + snakez);
+    }
+    GameObject CreateSnakeObject(Sprite s, Point p)
+    {
+        GameObject obj = new GameObject();
+        obj.AddComponent<SpriteRenderer>().sprite = s;
+        obj.transform.localPosition = CalcSnakeVec(p);
+        obj.name = "snake";
         return obj;
     }
-
-    private void ClearObject()
+    int GetHeadDir()
     {
-        while (usings.Count > 0)
-        {
-            GameObject obj = usings.Dequeue();
-            obj.SetActive(false);
-            unuseds.Enqueue(obj);
-        }
-
+        return skl.Last().Item3;
+    }
+    void SetHeadSprites(Sprite[] s)
+    {
+        skl.Last().Item1.GetComponent<SpriteRenderer>().sprite = s[GetHeadDir()];
     }
 
-    //Init Part
-    void GenerateMap()
-    {
-
-        sizex0 = -12;
-        sizex1 = 12;
-        sizey0 = -9;
-        sizey1 = 9;
-        back = new Back[sizex1 - sizex0, sizey1 - sizey0];
-        item = new Item[sizex1 - sizex0, sizey1 - sizey0];
-
-        for (int i = 2; i < 14; ++i)
-        {
-            for (int j = 2; j < 14; ++j)
-            {
-                back[i, j] = Back.ground;
-            }
-        }
-        back[5, 5] = Back.trap;
-        back[6, 7] = Back.exit;
-
-
-        snake.Enqueue((9, 10));
-        snake.Enqueue((10, 10));
-        snake.Enqueue((11, 10));
-        snake.Enqueue((12, 10));
-
-        item[4, 4] = Item.chili;
-        item[6, 8] = Item.banana;
-        foodcnt = 2;
-
-        item[7, 8] = Item.wall;
-        item[5, 6] = Item.wall;
-        item[8, 8] = Item.ice;
-    }
-
-    //Logic Part
-
+    //Calculation
     int CalcDir(Point a, Point b)
     {
         if (a.Item1 == b.Item1)
@@ -203,16 +170,130 @@ public class Map : MonoBehaviour
         return b;
     }
 
-    bool OutRange(Point p)
+    private Sprite CalcBodySprite(int d0, int d1)
+    {
+        if (d1 == d0)
+        {
+            return straights[d1];
+        }
+        else if (d1 == (d0 + 1) % 4)
+        {
+            return turns[d1];
+        }
+        else
+        {
+            return turns[(d0 + 2) % 4];
+        }
+    }
+
+
+    void InitSnake(List<Point> s)
+    {
+        //The initial length of the snake is at least 3
+        int n = s.Count - 1;
+        skl.AddLast((CreateSnakeObject(tails[CalcDir(s[0], s[1])], s[0]), s[0], 0));
+        for (int i = 1; i < n; ++i)
+        {
+            int d0 = CalcDir(s[i - 1], s[i]);
+            int d1 = CalcDir(s[i], s[i + 1]);
+            skl.AddLast((CreateSnakeObject(CalcBodySprite(d0, d1), s[i]), s[i], d0));
+        }
+        int d = CalcDir(s[n - 1], s[n]);
+        skl.AddLast((CreateSnakeObject(moveheads[d], s[n]), s[n], d));
+    }
+    void SnakeHead(Point p)//change head 
+    {
+        var last = skl.Last();
+        Point f = last.Item2;
+        int d0 = last.Item3;
+        int d1 = CalcDir(f, p);
+        last.Item1.GetComponent<SpriteRenderer>().sprite = CalcBodySprite(d0, d1);
+        skl.AddLast((CreateSnakeObject(moveheads[d1], p), p, d1));
+    }
+    void SnakeTail()
+    {
+        Destroy(skl.First().Item1);
+        skl.RemoveFirst();
+
+        if (skl.Count == 1)
+        {
+            if(status==Status.exiting)
+            {
+                skl.First().Item1.GetComponent<SpriteRenderer>().sprite = exitings[4];
+            }
+            else if(status==Status.trapped)
+            {
+                skl.First().Item1.GetComponent<SpriteRenderer>().sprite = trappings[4];
+            }
+        }
+        else if (skl.Count > 1)
+        {
+            skl.First().Item1.GetComponent<SpriteRenderer>().sprite = tails[skl.ElementAt(1).Item3];
+        }
+
+    }
+    void AddGround(Point p)
+    {
+        var (i, j) = p;
+        ground[i, j] = new GameObject();
+        ground[i, j].AddComponent<SpriteRenderer>().sprite = grounds[(i + j) % 2];
+        ground[i, j].transform.localPosition = new Vector3(i + sizex0, j + sizey0, j + groundz);
+        ground[i, j].name = "ground";
+    }
+    GameObject CreateObject(GameObject prefab, Point p, float z, string name)
+    {
+        GameObject obj = Instantiate(prefab);
+        obj.transform.localPosition = new Vector3(p.Item1 + sizex0, p.Item2 + sizey0, p.Item2 + z);
+        obj.name = name;
+        return obj;
+    }
+
+    void GenerateMap()
+    {
+        sizex0 = -24;
+        sizex1 = 24;
+        sizey0 = -15;
+        sizey1 = 15;
+
+        ground = new GameObject[sizex1 - sizex0, sizey1 - sizey0];
+        back = new GameObject[sizex1 - sizex0, sizey1 - sizey0];
+        item = new GameObject[sizex1 - sizex0, sizey1 - sizey0];
+
+
+        InitSnake(new List<Point> { (18, 13), (19, 13), (20, 13), (21, 13) });
+
+
+        for (int i = 14; i < 26; ++i)
+            for (int j = 8; j < 20; ++j)
+                AddGround((i, j));
+
+        back[17, 11] = CreateObject(trap, (17, 11), backz, "trap");
+        exitobj = back[18, 13] = CreateObject(exit, (18, 13), backz, "exit");
+
+        foodcnt = 2;
+        item[16, 10] = CreateObject(chili, (16, 10), itemz, "chili");
+        item[18, 14] = CreateObject(banana, (18, 14), itemz, "banana");
+        item[19, 14] = CreateObject(wall, (19, 14), itemz, "wall");
+        item[17, 12] = CreateObject(wall, (17, 12), itemz, "wall");
+        item[20, 14] = CreateObject(ice, (20, 14), itemz, "ice");
+    }
+
+    void AddMvitem(int x, int y)
+    {
+        mvitem.Add((item[x, y], (x, y)));
+        item[x, y] = null;
+    }
+
+    bool OutOfRange(Point p)
     {
         return p.Item1 < 0 || p.Item1 >= sizex1 - sizex0 ||
             p.Item2 < 0 || p.Item2 >= sizey1 - sizey0;
     }
-    bool WillFall()
+    bool SnakeFall()
     {
-        foreach (var (x, y) in snake)
+        foreach (var (obj, (x, y), d) in skl)
         {
-            if (back[x, y] != Back.none) return false;
+            if (ground[x, y] != null) return false;
         }
         return true;
 
@@ -221,133 +302,178 @@ public class Map : MonoBehaviour
     {
         List<Point> lst = new List<Point>();
         Point p = pt;
+
         while (true)
         {
-            if (snake.Contains(p) && p != snake.First())
+            if (OutOfRange(p)) return lst;
+            var emu = skl.GetEnumerator(); emu.MoveNext();
+            while (emu.MoveNext())
             {
-                return body ? null : lst;
+                if (emu.Current.Item2 == p)
+                {
+                    return body ? null : lst;
+                }
             }
-            if (OutRange(p)) return lst;
-            switch (item[p.Item1, p.Item2])
-            {
-                case Item.wall:
-                    return null;
-                case Item.none:
-                    return lst;
-            }
+            GameObject obj = item[p.Item1, p.Item2];
+            if (obj == null) return lst;
+            if (obj.name == "wall") return null;
             lst.Add(p);
             p = CalcPoint(p, dir);
         }
     }
-
-    void AddMvit(int x, int y)
-    {
-        mvit.Add(((x, y), item[x, y]));
-        item[x, y] = Item.none;
-    }
     bool Spitable()
     {
-        foreach (Point p in snake)
-        {
-            if (Pushable(CalcPoint(p, mdir), mdir, false) == null)
-            {
-                return false;
-            }
-        }
-        foreach (Point p in snake)
+        foreach (var (obj, p, d) in skl)
         {
             var lst = Pushable(CalcPoint(p, mdir), mdir, false);
+            if (lst == null)
+            {
+                mvitem.Clear();
+                return false;
+            }
             foreach (var (x, y) in lst)
             {
-                AddMvit(x, y);
+                AddMvitem(x, y);
             }
         }
         return true;
     }
 
-
+    void SetStatus(Status s)
+    {
+        status = s;
+        delt = 0;
+        switch (s)
+        {
+            case Status.still:
+                SetHeadSprites(moveheads);
+                break;
+            case Status.falling:
+                SetHeadSprites(sweatheads);
+                break;
+            case Status.trapped:
+                SetHeadSprites(trappings);
+                break;
+            case Status.exiting:
+                SetHeadSprites(exitings);
+                break;
+            case Status.spitting:
+            case Status.spitted:
+                SetHeadSprites(tearheads);
+                break;
+            case Status.eatingbanana:
+                SetHeadSprites(smileheads);
+                break;
+            case Status.eatingchili:
+                SetHeadSprites(stunheads);
+                break;
+        }
+    }
     void Move(int dir)
     {
         if (status != Status.still) return;
-        Point[] s = snake.ToArray();
-        int n = s.Length - 1;//[0,n]
-        int hdir = CalcDir(s[n - 1], s[n]);
+
+        int hdir = skl.Last().Item3;
         int rdir = (dir + 2) % 4;
 
-        var (nx, ny) = CalcPoint(s[n], dir);
+        Point np = CalcPoint(skl.Last().Item2, dir);
+        var (nx, ny) = np;
 
-        if (hdir == rdir || OutRange((nx, ny))) return;
+        if (hdir == rdir || OutOfRange(np)) return;
 
-
-        var lst = Pushable((nx, ny), dir, true);
-
+        var lst = Pushable(np, dir, true);
 
         if (lst != null)//if pushable
         {
-            snake.Dequeue();
-            snake.Enqueue((nx, ny));
-            if (back[nx, ny] == Back.exit && foodcnt == 0)
-            {
-                status = Status.exiting;
-                return;
-            }
-            if (back[nx, ny] == Back.trap)
-            {
-                status = Status.exiting;
-                return;
-            }
+            SnakeHead(np);
+            SnakeTail();
+            if(dustobj!=null) Destroy(dustobj);
+            dustobj = CreateObject(dust, skl.First().Item2, skl.First().Item2.Item2 + snakez, "dust");
 
             if (lst.Count > 0)
             {
+                audiosrc.PlayOneShot(pushsound);
                 for (int i = lst.Count - 1; i >= 0; --i)
                 {
                     var (x, y) = lst[i];
                     var (x1, y1) = CalcPoint(lst[i], dir);
                     item[x1, y1] = item[x, y];
-                    item[x, y] = Item.none;
+                    item[x1, y1].transform.localPosition = new Vector3(x1 + sizex0, y1 + sizey0, y1 + itemz);
+                    item[x, y] = null;
                 }
                 var (lx, ly) = CalcPoint(lst.Last(), dir);
-                if (item[lx, ly] != Item.none && back[lx, ly] == Back.none)
+                if (item[lx, ly] != null && ground[lx, ly] == null)
                 {
-                    delt = 0;
-                    status = Status.dropping;
+                    SetStatus(Status.dropping);
+                    audiosrc.PlayOneShot(fallsound);
                     mdir = 4;
-                    AddMvit(lx, ly);
+                    AddMvitem(lx, ly);
                 }
             }
-
-            if (WillFall())
+            else
             {
-                delt = 0;
-                status = Status.falling;
+                audiosrc.PlayOneShot(movesounds[rand.Next(0, movesounds.Length)]);
+            }
+
+            if (back[nx, ny]?.name == "exit" && foodcnt == 0)
+            {
+                SetStatus(Status.exiting);
+            }
+            else if (back[nx, ny]?.name == "trap")
+            {
+                SetStatus(Status.trapped);
+                audiosrc.PlayOneShot(trapsound);
+            }
+            else if (SnakeFall())
+            {
+                SetStatus(Status.falling);
+                audiosrc.PlayOneShot(fallsound);
                 mdir = 4;
             }
-            else if (mvit.Count == 0)
+            else if (mvitem.Count == 0)
             {
-                status = Status.still;
+                SetStatus(Status.still);
             }
-
-
         }
         else //if not pushable
         {
-            switch (item[nx, ny])
+            switch (item[nx, ny]?.name)
             {
-                case Item.chili:
-                    delt = 0;
-                    status = Status.eatingchili;
+                case "chili":
+                    SnakeHead(np);
+                    SnakeTail();
+
+
+                    SetStatus(Status.eatingchili);
+                    audiosrc.PlayOneShot(eatsounds[rand.Next(0, eatsounds.Length)]);
                     mdir = rdir;
-                    item[nx, ny] = Item.none;
-                    snake.Dequeue();
-                    snake.Enqueue((nx, ny));
+
+                    Destroy(item[nx, ny]);
+                    item[nx, ny] = null;
                     --foodcnt;
+                    if(foodcnt==0)
+                    {
+                        exitobj.GetComponent<Animator>().SetBool("open", true);
+                    }
+                    spitsrc.Play();
+
                     break;
-                case Item.banana:
-                    delt = 0;
-                    status = Status.eatingbanana;
-                    item[nx, ny] = Item.none;
-                    snake.Enqueue((nx, ny));
+                case "banana":
+                    SnakeHead(np);
+
+                    SetStatus(Status.eatingbanana);
+                    audiosrc.PlayOneShot(eatsounds[rand.Next(0, eatsounds.Length)]);
+
+                    Destroy(item[nx, ny]);
+                    item[nx, ny] = null;
                     --foodcnt;
+                    if (foodcnt == 0)
+                    {
+                        exitobj.GetComponent<Animator>().SetBool("open", true);
+                    }
+                    audiosrc.PlayOneShot(growsound);
+
+
                     break;
             }
         }
@@ -356,7 +482,7 @@ public class Map : MonoBehaviour
 
     //Paint Part
 
-    (float, float) CalcD(Point p)
+    (float, float) CalcOffset()
     {
         switch (mdir)
         {
@@ -374,191 +500,21 @@ public class Map : MonoBehaviour
         return (0, 0);
     }
 
-    void PaintSprite(Sprite sprite, int x, int y, float z, bool movable)
-    {
-        GameObject go = GetObject();
-        go.GetComponent<SpriteRenderer>().sprite = sprite;
-        var (dx, dy) = movable ? CalcD((x, y)) : (0, 0);
-        go.transform.localPosition = new Vector3(x + sizex0 + dx, y + sizey0 + dy, z);
-    }
-
-    void ShowBack()
-    {
-        for (int i = 0; i < sizex1 - sizex0; ++i)
-        {
-            for (int j = 0; j < sizey1 - sizey0; ++j)
-            {
-                if (back[i, j] != Back.none)
-                {
-                    PaintSprite(grounds[(i + j) % 2], i, j, j + 100, false);
-                }
-                float layer = 80;
-                switch (back[i, j])
-                {
-                    case Back.trap:
-                        PaintSprite(trap, i, j, j + layer, false);
-                        break;
-                    case Back.exit:
-                        PaintSprite(foodcnt > 0 ? closedexit : openexit, i, j, j + layer, false);
-                        break;
-                }
-
-            }
-        }
-    }
-    void ShowSnake()
-    {
-        Point[] s = snake.ToArray();
-        int n = s.Length - 1;//[0,n]
-
-        float layer = 60;
-        if (status == Status.falling) layer = 50;
-
-
-        int hdir = CalcDir(s[n - 1], s[n]);
-        int tdir = CalcDir(s[0], s[1]);
-
-        bool movable = false;
-        {
-            var (i, j) = s[n];
-            switch (status)
-            {
-                case Status.still:
-                case Status.dropping:
-                    PaintSprite(moveheads[hdir], i, j, j + layer, movable = false);
-                    break;
-                case Status.falling:
-                    PaintSprite(moveheads[hdir], i, j, j + layer, movable = true);
-                    break;
-                case Status.eatingchili:
-                    PaintSprite(stunheads[hdir], i, j, j + layer, movable = false);
-                    break;
-                case Status.eatingbanana:
-                    PaintSprite(smileheads[hdir], i, j, j + layer, movable = false);
-                    break;
-                case Status.spitting:
-                    PaintSprite(tearheads[hdir], i, j, j + layer, movable = true);
-                    break;
-                case Status.spitted:
-                    PaintSprite(tearheads[hdir], i, j, j + layer, movable = false);
-                    break;
-                case Status.exiting:
-                    PaintSprite(exitings[snake.Count > 1 ? hdir : 4], i, j, j + layer, movable = false);
-                    break;
-            }
-
-        }
-        PaintSprite(tails[tdir], s[0].Item1, s[0].Item2, s[0].Item2 + layer, movable);
-
-        for (int k = 1; k < n; ++k)
-        {
-            int d1 = CalcDir(s[k], s[k + 1]);
-            int d2 = CalcDir(s[k - 1], s[k]);
-            var (i, j) = s[k];
-
-
-            if (d1 == d2)
-            {
-                PaintSprite(straights[d1], i, j, j + layer, movable);
-            }
-            else
-            {
-                if (d1 == (d2 + 1) % 4)
-                {
-                    PaintSprite(turns[d1], i, j, j + layer, movable);
-                }
-                else
-                {
-                    PaintSprite(turns[(d2 + 2) % 4], i, j, j + layer, movable);
-                }
-
-            }
-        }
-    }
-
-    void ShowItems()
-    {
-        float layer = 60;
-        for (int i = 0; i < sizex1 - sizex0; ++i)
-        {
-            for (int j = 0; j < sizey1 - sizey0; ++j)
-            {
-                switch (item[i, j])
-                {
-                    case Item.wall:
-                        PaintSprite(wall, i, j, j + layer, false);
-                        break;
-                    case Item.ice:
-                        PaintSprite(ice, i, j, j + layer, false);
-                        break;
-                    case Item.chili:
-                        PaintSprite(chili, i, j, j + layer, false);
-                        break;
-                    case Item.banana:
-                        PaintSprite(banana, i, j, j + layer, false);
-                        break;
-                }
-            }
-        }
-        layer = (status == Status.dropping || status == Status.falling) ? 30 : 8;
-        foreach (var ((i, j), it) in mvit)
-        {
-
-            switch (it)
-            {
-                case Item.wall:
-                    PaintSprite(wall, i, j, j + layer, true);
-                    break;
-                case Item.ice:
-                    PaintSprite(ice, i, j, j + layer, true);
-                    break;
-                case Item.chili:
-                    PaintSprite(chili, i, j, j + layer, true);
-                    break;
-                case Item.banana:
-                    PaintSprite(banana, i, j, j + layer, true);
-                    break;
-            }
-        }
-    }
-    void Show()
-    {
-        ClearObject();
-
-        if (status == Status.win)
-        {
-
-            return;
-        }
-        if (status == Status.lose)
-        {
-
-            return;
-        }
-
-        ShowBack();
-        ShowSnake();
-        ShowItems();
-
-    }
-
-
-
     void CalcInput()
     {
-        if (Input.GetKeyDown(KeyCode.W))
+        if (Input.GetKeyDown(KeyCode.W) || Input.GetKeyDown(KeyCode.UpArrow))
         {
             Move(3);
         }
-        else if (Input.GetKeyDown(KeyCode.S))
+        else if (Input.GetKeyDown(KeyCode.S) || Input.GetKeyDown(KeyCode.DownArrow))
         {
             Move(1);
         }
-        else if (Input.GetKeyDown(KeyCode.A))
+        else if (Input.GetKeyDown(KeyCode.A) || Input.GetKeyDown(KeyCode.LeftArrow))
         {
             Move(2);
         }
-        else if (Input.GetKeyDown(KeyCode.D))
+        else if (Input.GetKeyDown(KeyCode.D) || Input.GetKeyDown(KeyCode.RightArrow))
         {
             Move(0);
         }
@@ -566,97 +522,122 @@ public class Map : MonoBehaviour
 
     void UpdateState()
     {
+        var (dx, dy) = CalcOffset();
         delt += Time.deltaTime;
         switch (status)
         {
             case Status.eatingchili:
                 if (delt > 0.3)
                 {
-                    delt = 0;
-                    if (Spitable())
-                    {
-                        status = Status.spitting;
-                    }
-                    else
-                    {
-                        status = Status.spitted;
-                    }
+                    SetStatus(Spitable() ? Status.spitting : Status.spitted);
+                    fireobj = CreateObject(fire, skl.Last().Item2, snakez, "fire");
+                    fireobj.transform.localEulerAngles = new Vector3(0, 0, -(skl.Last().Item3) * 90);
+                    camvib.StartVibration();
+
                 }
                 break;
             case Status.spitting:
+                Point fp = CalcPoint(skl.Last().Item2, skl.Last().Item3);
+                fireobj.transform.localPosition = new Vector3(fp.Item1 + sizex0 + dx, fp.Item2 + sizey0 + dy, snakez);
+                foreach (var (obj, p) in mvitem)
+                {
+                    obj.transform.localPosition = new Vector3(p.Item1 + sizex0 + dx, p.Item2 + sizey0 + dy, itemz);
+                }
+                foreach (var (obj, p, d) in skl)
+                {
+                    obj.transform.localPosition = new Vector3(p.Item1 + sizex0 + dx, p.Item2 + sizey0 + dy, snakez);
+                }
                 if (delt > spittime)
                 {
-                    delt = 0;
-                    foreach (var ((x, y), it) in mvit)
-                    {
-                        var (nx, ny) = CalcPoint((x, y), mdir);
-                        if (!OutRange((nx, ny))) item[nx, ny] = it;
-                    }
-                    var lst = snake.ToList();
-                    snake.Clear();
-                    bool org = false;
-                    foreach (var p in lst)
+                    foreach (var (obj, p) in mvitem)
                     {
                         Point q = CalcPoint(p, mdir);
-                        if (OutRange(q))
-                        {
-                            org = true;
-                            break;
-                        }
-                        snake.Enqueue(q);
+                        if (!OutOfRange(q)) item[q.Item1, q.Item2] = obj;
                     }
-                    if (org)
+                    var lst = skl.ToList();
+                    skl.Clear();
+                    bool ofr = false;
+                    foreach (var (obj, p, d) in lst)
                     {
-                        status = Status.lose;
-                        break;
+                        Point q = CalcPoint(p, mdir);
+                        if (OutOfRange(q)) ofr = true;
+                        obj.transform.localPosition = CalcSnakeVec(q);
+                        skl.AddLast((obj, q, d));
                     }
-                    mvit.Clear();
-                    if (!Spitable()) status = Status.spitted;
+                    mvitem.Clear();
+                    if (ofr)
+                    {
+                        SetStatus(Status.lose);
+                        camvib.StopVibration();
+                        spitsrc.Stop();
+                        Destroy(fireobj);
+                    }
+                    else SetStatus(Spitable() ? Status.spitting : Status.spitted);
+                }
+                break;
+            case Status.spitted:
+                if (delt > 0.5)
+                {
+                    SetStatus(Status.still);
+                    camvib.StopVibration();
+                    Destroy(fireobj);
+                    spitsrc.Stop();
                 }
                 break;
             case Status.eatingbanana:
                 if (delt > 0.5)
                 {
-                    delt = 0;
-                    status = Status.still;
+                    SetStatus(Status.still);
                 }
                 break;
             case Status.falling:
-
+                foreach (var (obj, p) in mvitem)
+                {
+                    obj.transform.localPosition = new Vector3(p.Item1 + sizex0 + dx, p.Item2 + sizey0 + dy, fallz);
+                }
+                foreach (var (obj, p, d) in skl)
+                {
+                    obj.transform.localPosition = new Vector3(p.Item1 + sizex0 + dx, p.Item2 + sizey0 + dy, fallz);
+                }
                 if (delt > 1)
                 {
-                    delt = 0;
-                    status = Status.lose;
-                    mvit.Clear();
+                    SetStatus(Status.lose);
+                    mvitem.Clear();
                 }
                 break;
             case Status.dropping:
-
+                foreach (var (obj, p) in mvitem)
+                {
+                    obj.transform.localPosition = new Vector3(p.Item1 + sizex0 + dx, p.Item2 + sizey0 + dy, fallz);
+                }
                 if (delt > 1)
                 {
-                    delt = 0;
-                    status = Status.still;
-                    mvit.Clear();
-                }
-                break;
-
-            case Status.spitted:
-                if (delt > 0.5)
-                {
-                    delt = 0;
-                    status = Status.still;
-
+                    SetStatus(Status.still);
+                    mvitem.Clear();
                 }
                 break;
             case Status.exiting:
                 if (delt > 0.15)
                 {
-                    delt = 0;
-                    snake.Dequeue();
-                    if (snake.Count == 0)
+                    SetStatus(Status.exiting);
+                    SnakeTail();
+                    if (skl.Count == 0)
                     {
-                        status = Status.win;
+                        SetStatus(Status.win);
+                        exitobj.GetComponent<Animator>().SetBool("open", false);
+                        audiosrc.PlayOneShot(exitsound);
 
+                    }
+                }
+                break;
+            case Status.trapped:
+                if (delt > 0.15)
+                {
+                    SetStatus(Status.trapped);
+                    SnakeTail();
+                    if (skl.Count == 0)
+                    {
+                        SetStatus(Status.lose);
                     }
                 }
                 break;
@@ -666,15 +647,12 @@ public class Map : MonoBehaviour
     void Start()
     {
         GenerateMap();
-
-
+        camvib = GameObject.Find("Main Camera").GetComponent<CameraVib>();
     }
 
     void Update()
     {
         CalcInput();
         UpdateState();
-        Show();
-
     }
 }

@@ -3,7 +3,14 @@
 --- !u!78 &1
 TagManager:
   serializedVersion: 2
-  tags: []
+  tags:
+  - Banana
+  - Chili
+  - Ice
+  - Wood
+  - Wall
+  - Trap
+  - Exit
   layers:
   - Default
   - TransparentFX
